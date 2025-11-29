@@ -31,6 +31,12 @@ $username = "root"
 $checkIntervalSeconds = 10       # 检查间隔 10 秒
 $timeoutMilliseconds  = 5000     # 连接超时 5 秒
 
+# 给私钥设置严格权限（关键步骤）
+# /inheritance:r：去掉继承的权限；
+# /grant:r 用户名:(R)：只给当前用户读取权限。
+icacls ".\.ssh\id_rsa" /inheritance:r
+icacls ".\.ssh\id_rsa" /grant:r "$($env:USERNAME):(R)"
+
 # 规范化 SSH 私钥路径为绝对路径（允许相对脚本目录）
 if (-not [System.IO.Path]::IsPathRooted($SshKeyPath)) {
     $SshKeyPath = Join-Path -Path $PSScriptRoot -ChildPath $SshKeyPath
