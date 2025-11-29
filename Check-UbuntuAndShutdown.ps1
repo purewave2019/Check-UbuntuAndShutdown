@@ -179,58 +179,48 @@ function Test-IsWithinWindow {
     }
 }
 
-# 加载历史状态
-$state = Load-State -Path $StateFilePath
-
-# 当前日期（每天以 yyyy-MM-dd 为 key）
+# 当前日期（用于跨天检测）
 $currentDateKey = (Get-Date -Format 'yyyy-MM-dd')
-
-# 如果当前日期不存在则初始化为 0（修正运算优先级确保判断生效）
-if (-not ($state.PSObject.Properties.Name -contains $currentDateKey)) {
-    $state | Add-Member -NotePropertyName $currentDateKey -NotePropertyValue 0 -Force
-}
-
-# 当前日期已累计的在线秒数
-$dailyOnlineSeconds = [int]$state.$currentDateKey
 
 Write-Log "开始监控 ${ip}:${port}"
 Write-Log "每 $checkIntervalSeconds 秒检查一次，当天累计在线超过 $($DailyThresholdSeconds/60) 分钟后，将通过 SSH（密钥：$SshKeyPath）执行远程命令：'$RemoteCommand'"
 Write-Log "时间窗口：$($ActiveStartHour):00-$($ActiveEndHour):00（起始含，结束不含；支持跨日）。窗口之外将立即执行远程命令"
 Write-Log "日志文件路径：$LogFilePath"
 Write-Log "状态文件路径：$StateFilePath"
-Write-Log "当前日期 $currentDateKey 已累计在线：$dailyOnlineSeconds 秒"
 Write-Log "当前配置的 DailyThresholdSeconds = $DailyThresholdSeconds 秒"
+Write-Log "注意：每次循环都会从状态文件重新加载在线时长"
 
 if ($ActiveStartHour -eq $ActiveEndHour) {
     Write-Log "注意：ActiveStartHour 与 ActiveEndHour 相同，视为全天均在窗口内：仅当累计时长达到阈值时才会执行远程命令，不会立即执行。" "WARN"
 }
 
 while ($true) {
+    # 每次循环都从文件重新加载状态
+    $state = Load-State -Path $StateFilePath
+
     $nowDateKey = (Get-Date -Format 'yyyy-MM-dd')
 
-    # 如果跨天了，切换到新日期并重新统计
+    # 如果跨天了，切换到新日期
     if ($nowDateKey -ne $currentDateKey) {
         Write-Log "检测到日期变更：$currentDateKey -> $nowDateKey，开始新一天的统计"
         $currentDateKey = $nowDateKey
-
-        # 修正运算优先级确保判断生效
-        if (-not ($state.PSObject.Properties.Name -contains $currentDateKey)) {
-            $state | Add-Member -NotePropertyName $currentDateKey -NotePropertyValue 0 -Force
-        }
-
-        $dailyOnlineSeconds = [int]$state.$currentDateKey
-        Write-Log "新日期 $currentDateKey 当前累计在线：$dailyOnlineSeconds 秒"
     }
+
+    # 确保当前日期的键存在
+    if (-not ($state.PSObject.Properties.Name -contains $currentDateKey)) {
+        $state | Add-Member -NotePropertyName $currentDateKey -NotePropertyValue 0 -Force
+    }
+
+    # 读取当前日期已累计的在线秒数
+    $dailyOnlineSeconds = [int]$state.$currentDateKey
 
     $isOnline = Test-TcpPort -TargetHost $ip -Port $port -TimeoutMs $timeoutMilliseconds
 
     if ($isOnline) {
+        # 增加在线时长
         $dailyOnlineSeconds += $checkIntervalSeconds
 
-        # 防御性检查：若属性缺失则先创建
-        if (-not ($state.PSObject.Properties.Name -contains $currentDateKey)) {
-            $state | Add-Member -NotePropertyName $currentDateKey -NotePropertyValue 0 -Force
-        }
+        # 更新状态
         $state.$currentDateKey = $dailyOnlineSeconds
 
         Write-Log "$ip 在线，当天累计在线时间：$dailyOnlineSeconds 秒"
