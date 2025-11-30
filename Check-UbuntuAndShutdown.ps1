@@ -306,14 +306,13 @@ while ($true) {
 
         # 更新状态
         $state.$currentDateKey = $dailyOnlineSeconds
-
-        Write-Log "$ip 在线，当天累计在线时间：$dailyOnlineSeconds 秒"
         Save-State -State $state -Path $StateFilePath
 
         # 时间窗口：处在窗口内按阈值；窗口之外立即执行
         $now = Get-Date
         $isWithinWindow = Test-IsWithinAnyWindow -Hour $now.Hour -Windows $config.ActiveWindows
         Write-Log "当前时间：$($now.ToString('HH:mm:ss'))，当前小时：$($now.Hour)，窗口内：$isWithinWindow"
+        Write-Log "$ip 在线，当天累计在线时间：$dailyOnlineSeconds 秒"
         if (-not $isWithinWindow) {
             Write-Log "当前时间 $($now.ToString('HH:mm')) 不在任何配置的窗口内，立即执行远程命令：'$RemoteCommand'"
             Invoke-RemoteCommand -Command $RemoteCommand
