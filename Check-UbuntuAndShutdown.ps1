@@ -265,21 +265,23 @@ $config = Load-Config -Path $ConfigFilePath
 
 Write-Log "开始监控 ${ip}:${port}"
 Write-Log "每 $checkIntervalSeconds 秒检查一次，超过阈值将通过 SSH（密钥：$SshKeyPath）执行远程命令：'$RemoteCommand'"
-Write-Log ("时间窗口集合：" + (($config.ActiveWindows | ForEach-Object { "$($_.StartHour):00-$($_.EndHour):00" }) -join ', ') + " （起始含，结束不含；支持跨日）。窗口之外将立即执行远程命令")
 Write-Log "日志文件路径：$LogFilePath"
 Write-Log "状态文件路径：$StateFilePath"
 Write-Log "配置文件路径：$ConfigFilePath"
-Write-Log "当前配置的 DailyThresholdSeconds = $($config.DailyThresholdSeconds) 秒"
 Write-Log "注意：每次循环都会从配置文件和状态文件重新加载"
 
-if ($config.ActiveWindows | Where-Object { $_.StartHour -eq $_.EndHour }) {
-    Write-Log "注意：存在 StartHour==EndHour 的窗口，视为全天有效：仅当累计时长达到阈值时才会执行远程命令，不会立即执行。" "WARN"
-}
 
 while ($true) {
     # 每次循环都从文件重新加载状态与配置，第三方修改实时生效
     $state  = Load-State  -Path $StateFilePath
     $config = Load-Config -Path $ConfigFilePath
+
+    # 每次循环输出当前配置
+    Write-Log ("当前配置 DailyThresholdSeconds = $($config.DailyThresholdSeconds) 秒 (" + [math]::Round($config.DailyThresholdSeconds/60, 2) + " 分钟)")
+    Write-Log ("当前时间窗口：" + (($config.ActiveWindows | ForEach-Object { "$($_.StartHour):00-$($_.EndHour):00" }) -join ', '))
+    if ($config.ActiveWindows | Where-Object { $_.StartHour -eq $_.EndHour }) {
+        Write-Log "检测到 StartHour==EndHour 的窗口（全天有效），窗口内按阈值判断" "WARN"
+    }
 
     $nowDateKey = (Get-Date -Format 'yyyy-MM-dd')
 
