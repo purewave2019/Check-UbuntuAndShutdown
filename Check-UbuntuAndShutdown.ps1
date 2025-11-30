@@ -11,16 +11,8 @@ param(
 # SSH 私钥路径（相对脚本目录或绝对路径）
     [string]$SshKeyPath = ".\.ssh\id_rsa",
 
-# 每天累计在线阈值（秒），默认 3600 秒（1 小时）
-    [int]$DailyThresholdSeconds = 3600,
-
-# 时间窗口开始小时（0-23），含，默认 9
-    [ValidateRange(0,23)]
-    [int]$ActiveStartHour = 9,
-
-# 时间窗口结束小时（0-23），不含，默认 21
-    [ValidateRange(0,23)]
-    [int]$ActiveEndHour = 21
+# 配置文件路径（相对脚本目录或绝对路径），包含每日阈值与时间窗口
+    [string]$ConfigFilePath = ".\UbuntuMonitor.config.json"
 )
 
 # 基本参数配置
@@ -37,9 +29,18 @@ $timeoutMilliseconds  = 5000     # 连接超时 5 秒
 icacls ".\.ssh\id_rsa" /inheritance:r
 icacls ".\.ssh\id_rsa" /grant:r "$($env:USERNAME):(R)"
 
-# 规范化 SSH 私钥路径为绝对路径（允许相对脚本目录）
+# 规范化关键路径为绝对路径（允许相对脚本目录）
 if (-not [System.IO.Path]::IsPathRooted($SshKeyPath)) {
     $SshKeyPath = Join-Path -Path $PSScriptRoot -ChildPath $SshKeyPath
+}
+if (-not [System.IO.Path]::IsPathRooted($LogFilePath)) {
+    $LogFilePath = Join-Path -Path $PSScriptRoot -ChildPath $LogFilePath
+}
+if (-not [System.IO.Path]::IsPathRooted($StateFilePath)) {
+    $StateFilePath = Join-Path -Path $PSScriptRoot -ChildPath $StateFilePath
+}
+if (-not [System.IO.Path]::IsPathRooted($ConfigFilePath)) {
+    $ConfigFilePath = Join-Path -Path $PSScriptRoot -ChildPath $ConfigFilePath
 }
 
 # 确保日志文件存在（如果不存在就创建一个空文件）
@@ -60,6 +61,85 @@ function Write-Log {
 
     # 追加写入日志文件
     Add-Content -Path $LogFilePath -Value $line
+}
+
+# 读取配置（每日阈值与时间窗口），每次循环调用，第三方修改可实时生效
+function Load-Config {
+    param(
+        [string]$Path
+    )
+
+    $default = [pscustomobject]@{
+        DailyThresholdSeconds = 3600
+        ActiveWindows         = @([pscustomobject]@{ StartHour = 9; EndHour = 21 })
+        # 兼容旧字段（如果老配置里只有 ActiveStartHour / ActiveEndHour）
+        ActiveStartHour       = 9
+        ActiveEndHour         = 21
+    }
+
+    if (-not (Test-Path -Path $Path)) {
+        try {
+            # 写入新的多窗口结构（默认单窗口）
+            ([pscustomobject]@{
+                DailyThresholdSeconds = $default.DailyThresholdSeconds
+                ActiveWindows         = $default.ActiveWindows
+            }) | ConvertTo-Json -Depth 5 | Set-Content -Path $Path -Encoding UTF8
+            Write-Log "配置文件不存在，已写入默认配置到：$Path" "WARN"
+        }
+        catch {
+            Write-Log "创建默认配置文件失败：$($_.Exception.Message)" "ERROR"
+        }
+        return $default
+    }
+
+    try {
+        $json = Get-Content -Path $Path -Raw
+        if ([string]::IsNullOrWhiteSpace($json)) {
+            Write-Log "配置文件内容为空，使用默认配置" "WARN"
+            return $default
+        }
+        $cfg = $json | ConvertFrom-Json
+        if ($null -eq $cfg) { return $default }
+
+        # DailyThresholdSeconds 校验
+        $DailyThresholdSeconds = [int]($cfg.DailyThresholdSeconds)
+        if ($DailyThresholdSeconds -le 0) { $DailyThresholdSeconds = $default.DailyThresholdSeconds }
+
+        # 构建窗口数组：优先使用 ActiveWindows；否则尝试旧字段 ActiveStartHour/ActiveEndHour
+        $windows = @()
+        if ($cfg.PSObject.Properties.Name -contains 'ActiveWindows' -and $cfg.ActiveWindows) {
+            foreach ($w in $cfg.ActiveWindows) {
+                try {
+                    $sh = [int]$w.StartHour
+                    $eh = [int]$w.EndHour
+                    if ($sh -lt 0 -or $sh -gt 23 -or $eh -lt 0 -or $eh -gt 23) { continue }
+                    $windows += [pscustomobject]@{ StartHour = $sh; EndHour = $eh }
+                }
+                catch { continue }
+            }
+        }
+        elseif (($cfg.PSObject.Properties.Name -contains 'ActiveStartHour') -and ($cfg.PSObject.Properties.Name -contains 'ActiveEndHour')) {
+            $sh = [int]$cfg.ActiveStartHour
+            $eh = [int]$cfg.ActiveEndHour
+            if ($sh -ge 0 -and $sh -le 23 -and $eh -ge 0 -and $eh -le 23) {
+                $windows += [pscustomobject]@{ StartHour = $sh; EndHour = $eh }
+            }
+        }
+
+        if ($windows.Count -eq 0) {
+            Write-Log "未找到有效时间窗口配置，使用默认窗口" "WARN"
+            $windows = $default.ActiveWindows
+        }
+
+        return [pscustomobject]@{
+            DailyThresholdSeconds = $DailyThresholdSeconds
+            ActiveWindows         = $windows
+        }
+    }
+    catch {
+        Write-Log "读取配置文件失败，使用默认配置。错误：$($_.Exception.Message)" "WARN"
+        return $default
+    }
 }
 
 function Test-TcpPort {
@@ -158,45 +238,48 @@ function Invoke-RemoteCommand {
 }
 
 # 判断当前小时是否处在配置的时间窗口内（支持跨日）
-function Test-IsWithinWindow {
+function Test-IsWithinAnyWindow {
     param(
         [int]$Hour,
-        [int]$StartHour,
-        [int]$EndHour
+        [array]$Windows
     )
-
-    if ($StartHour -eq $EndHour) {
-        # 视为全天处于窗口内
-        return $true
+    foreach ($w in $Windows) {
+        $StartHour = [int]$w.StartHour
+        $EndHour   = [int]$w.EndHour
+        if ($StartHour -eq $EndHour) { return $true }
+        elseif ($StartHour -lt $EndHour) {
+            if ($Hour -ge $StartHour -and $Hour -lt $EndHour) { return $true }
+        }
+        else {
+            if ($Hour -ge $StartHour -or $Hour -lt $EndHour) { return $true }
+        }
     }
-    elseif ($StartHour -lt $EndHour) {
-        # 同日窗口 [start, end)
-        return ($Hour -ge $StartHour -and $Hour -lt $EndHour)
-    }
-    else {
-        # 跨日窗口，例如 21->9： [start,24) ∪ [0,end)
-        return ($Hour -ge $StartHour -or $Hour -lt $EndHour)
-    }
+    return $false
 }
 
 # 当前日期（用于跨天检测）
 $currentDateKey = (Get-Date -Format 'yyyy-MM-dd')
 
+# 首次读取配置
+$config = Load-Config -Path $ConfigFilePath
+
 Write-Log "开始监控 ${ip}:${port}"
-Write-Log "每 $checkIntervalSeconds 秒检查一次，当天累计在线超过 $($DailyThresholdSeconds/60) 分钟后，将通过 SSH（密钥：$SshKeyPath）执行远程命令：'$RemoteCommand'"
-Write-Log "时间窗口：$($ActiveStartHour):00-$($ActiveEndHour):00（起始含，结束不含；支持跨日）。窗口之外将立即执行远程命令"
+Write-Log "每 $checkIntervalSeconds 秒检查一次，超过阈值将通过 SSH（密钥：$SshKeyPath）执行远程命令：'$RemoteCommand'"
+Write-Log ("时间窗口集合：" + (($config.ActiveWindows | ForEach-Object { "$($_.StartHour):00-$($_.EndHour):00" }) -join ', ') + " （起始含，结束不含；支持跨日）。窗口之外将立即执行远程命令")
 Write-Log "日志文件路径：$LogFilePath"
 Write-Log "状态文件路径：$StateFilePath"
-Write-Log "当前配置的 DailyThresholdSeconds = $DailyThresholdSeconds 秒"
-Write-Log "注意：每次循环都会从状态文件重新加载在线时长"
+Write-Log "配置文件路径：$ConfigFilePath"
+Write-Log "当前配置的 DailyThresholdSeconds = $($config.DailyThresholdSeconds) 秒"
+Write-Log "注意：每次循环都会从配置文件和状态文件重新加载"
 
-if ($ActiveStartHour -eq $ActiveEndHour) {
-    Write-Log "注意：ActiveStartHour 与 ActiveEndHour 相同，视为全天均在窗口内：仅当累计时长达到阈值时才会执行远程命令，不会立即执行。" "WARN"
+if ($config.ActiveWindows | Where-Object { $_.StartHour -eq $_.EndHour }) {
+    Write-Log "注意：存在 StartHour==EndHour 的窗口，视为全天有效：仅当累计时长达到阈值时才会执行远程命令，不会立即执行。" "WARN"
 }
 
 while ($true) {
-    # 每次循环都从文件重新加载状态
-    $state = Load-State -Path $StateFilePath
+    # 每次循环都从文件重新加载状态与配置，第三方修改实时生效
+    $state  = Load-State  -Path $StateFilePath
+    $config = Load-Config -Path $ConfigFilePath
 
     $nowDateKey = (Get-Date -Format 'yyyy-MM-dd')
 
@@ -215,7 +298,6 @@ while ($true) {
     $dailyOnlineSeconds = [int]$state.$currentDateKey
 
     $isOnline = Test-TcpPort -TargetHost $ip -Port $port -TimeoutMs $timeoutMilliseconds
-
     if ($isOnline) {
         # 增加在线时长
         $dailyOnlineSeconds += $checkIntervalSeconds
@@ -228,15 +310,13 @@ while ($true) {
 
         # 时间窗口：处在窗口内按阈值；窗口之外立即执行
         $now = Get-Date
-        $isWithinWindow = Test-IsWithinWindow -Hour $now.Hour -StartHour $ActiveStartHour -EndHour $ActiveEndHour
+        $isWithinWindow = Test-IsWithinAnyWindow -Hour $now.Hour -Windows $config.ActiveWindows
         if (-not $isWithinWindow) {
-            Write-Log "当前时间 $($now.ToString('HH:mm')) 不在 $($ActiveStartHour):00-$($ActiveEndHour):00 之间，立即执行远程命令：'$RemoteCommand'"
+            Write-Log "当前时间 $($now.ToString('HH:mm')) 不在任何配置的窗口内，立即执行远程命令：'$RemoteCommand'"
             Invoke-RemoteCommand -Command $RemoteCommand
         }
-        elseif ($dailyOnlineSeconds -ge $DailyThresholdSeconds) {
-            Write-Log "$ip 在 $currentDateKey 当天累计在线时间已超过 $($DailyThresholdSeconds/60) 分钟，准备通过 SSH 执行远程命令：'$RemoteCommand'"
-
-            # 使用统一的封装执行
+        elseif ($dailyOnlineSeconds -ge $config.DailyThresholdSeconds) {
+            Write-Log "$ip 在 $currentDateKey 当天累计在线时间已超过 $([math]::Round($config.DailyThresholdSeconds/60,2)) 分钟（窗口内），准备通过 SSH 执行远程命令：'$RemoteCommand'"
             Invoke-RemoteCommand -Command $RemoteCommand
         }
     }
