@@ -1,5 +1,5 @@
 {
-  "DailyThresholdSeconds": 10800,
+  "DailyThresholdSeconds": 28800,
   "ActiveWindows": [
     { "StartHour": 9,  "EndHour": 13 },
     { "StartHour": 14, "EndHour": 18 },
