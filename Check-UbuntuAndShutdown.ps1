@@ -12,7 +12,10 @@ param(
     [string]$SshKeyPath = ".\.ssh\id_rsa",
 
 # 配置文件路径（相对脚本目录或绝对路径），包含每日阈值与时间窗口
-    [string]$ConfigFilePath = ".\UbuntuMonitor.config.json"
+    [string]$ConfigFilePath = ".\UbuntuMonitor.config.json",
+
+# 日志最多保留的条数
+    [int]$MaxLogLines = 20000
 )
 
 # 基本参数配置
@@ -27,7 +30,7 @@ $timeoutMilliseconds  = 5000     # 连接超时 5 秒
 # /inheritance:r：去掉继承的权限；
 # /grant:r 用户名:(R)：只给当前用户读取权限。
 icacls ".\.ssh\id_rsa" /inheritance:r
-icacls ".\.ssh\id_rsa" /grant:r "$($env:USERNAME):(R)"
+icacls ".\.ssh\id_rsa" /grant:r "$("$($env:USERNAME)"):(R)"
 
 # 规范化关键路径为绝对路径（允许相对脚本目录）
 if (-not [System.IO.Path]::IsPathRooted($SshKeyPath)) {
@@ -48,6 +51,30 @@ if (-not (Test-Path -Path $LogFilePath)) {
     New-Item -ItemType File -Path $LogFilePath -Force | Out-Null
 }
 
+# 日志修剪的上次执行时间（用于节流），初始化为很早的时间以便首次尽快修剪
+$script:LastTrimTime = [datetime]::MinValue
+
+# 日志修剪：仅保留最后 N 行
+function Trim-LogFile {
+    param(
+        [string]$Path,
+        [int]$MaxLines = 20000
+    )
+
+    try {
+        if (-not (Test-Path -Path $Path)) { return }
+        # 使用 -Tail 高效读取最后 N 行，然后原子替换
+        $tail = Get-Content -Path $Path -Tail $MaxLines -ErrorAction Stop
+        $temp = "$Path.tmp"
+        $tail | Set-Content -Path $temp -Encoding UTF8
+        Move-Item -Path $temp -Destination $Path -Force
+    }
+    catch {
+        # 避免递归调用 Write-Log，这里直接输出到控制台
+        Write-Host "[Trim-LogFile] 修剪日志失败：$($_.Exception.Message)"
+    }
+}
+
 function Write-Log {
     param(
         [string]$Message,
@@ -61,6 +88,19 @@ function Write-Log {
 
     # 追加写入日志文件
     Add-Content -Path $LogFilePath -Value $line
+
+    # 轻量节流的日志修剪（默认每 30 秒最多执行一次）
+    try {
+        $now = Get-Date
+        if ((($now) - $script:LastTrimTime).TotalSeconds -ge 30) {
+            Trim-LogFile -Path $LogFilePath -MaxLines $MaxLogLines
+            $script:LastTrimTime = $now
+        }
+    }
+    catch {
+        # 修剪异常不影响主流程
+        Write-Host "[Write-Log] 日志修剪触发失败：$($_.Exception.Message)"
+    }
 }
 
 # 读取配置（每日阈值与时间窗口），每次循环调用，第三方修改可实时生效
